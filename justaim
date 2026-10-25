@@ -1,0 +1,899 @@
+-- Tx15 dev — Pure Elite Aimbot & Clean ESP Framework
+-- Target Version: Roblox / BlockSpin v1.0+
+-- Runtime: Luau / Client Script (Zero-Trace Execution Mode)
+
+-- 1. Deep Environment Sanitization & Log Hook Stripping
+local _print, _warn, _error = print, warn, error
+local function noop(...) end
+print, warn, error = noop, noop, noop
+
+pcall(function()
+    local LogService = game:GetService("LogService")
+    LogService.MessageOut:Connect(function()
+        -- Intercept and completely drop warning streams to prevent client report hooks
+    end)
+end)
+
+-- 2. Clean Existing Instances to Avoid Duplicate Detection Flags
+pcall(function()
+    if gethui and gethui():FindFirstChild("Tx15_Stealth_Menu") then
+        gethui().Tx15_Stealth_Menu:Destroy()
+    elseif game.CoreGui:FindFirstChild("Tx15_Stealth_Menu") then
+        game.CoreGui.Tx15_Stealth_Menu:Destroy()
+    end
+end)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPack = game:GetService("StarterPack")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+local ConfigFolder = "Tx15_BlockSpin_Configs"
+local BootConfigPath = ConfigFolder .. "/BootConfig.json"
+
+pcall(function()
+    if writefile and not isfolder(ConfigFolder) then
+        makefolder(ConfigFolder)
+    end
+end)
+
+local Config = {
+    CurrentProfile = "Default",
+    AimbotActive = false,
+    AimKey = "E",
+    FOVRadius = 140,
+    FOVOffsetY = 0,
+    ShowFOV = true,
+    AimPartMode = 1,
+    AimStrength = 1.0, -- Default 1.0 (Instant Snap / Rage Mode)
+    WallCheck = true,
+    ESPEnabled = true,
+    ESPInventoryEnabled = true,
+    MenuKey = "Insert"
+}
+
+-- ESP Rarity Configuration
+local MAX_DISTANCE = 2000
+local UPDATE_INTERVAL = 1
+local BillboardCache = {}
+local nameCache = {} 
+
+local RARITY_COLORS = {
+    ["Common"] = Color3.fromRGB(255, 255, 255),
+    ["Uncommon"] = Color3.fromRGB(99, 255, 52),
+    ["Rare"] = Color3.fromRGB(51, 170, 255),
+    ["Epic"] = Color3.fromRGB(237, 44, 255),
+    ["Legendary"] = Color3.fromRGB(255, 150, 0),
+    ["Omega"] = Color3.fromRGB(255, 20, 51),
+}
+
+local AIM_MODES = {
+    {name = "Head (fixed)",               part = "Head",                        color = Color3.fromRGB(100,100,255)},
+    {name = "Torso (fixed)",              part = "HumanoidRootPart",            color = Color3.fromRGB(255,150,50)},
+    {name = "Right Arm (fixed)",          part = "RightUpperArm",               color = Color3.fromRGB(50,205,50)},
+    {name = "Left Arm (fixed)",           part = "LeftUpperArm",                color = Color3.fromRGB(50,255,150)},
+    {name = "Auto Switch (Head ↔ Torso)", parts = {"Head", "HumanoidRootPart"}, color = Color3.fromRGB(180,100,255)},
+    {name = "Auto Switch (Right ↔ Left Arm)", parts = {"RightUpperArm", "LeftUpperArm"}, color = Color3.fromRGB(255, 255, 0)} 
+}
+
+local currentAutoIndex = 1
+local lastSwitchTime = 0
+local SWITCH_INTERVAL = 0.7
+local PREDICTION_TIME = 0.03
+
+local function getRealName(t)
+    if not t or not t.Name then return nil end
+    local originalName = t.Name
+    local lowerName = originalName:lower()
+
+    local cleaned = lowerName
+        :gsub("%d+$", "")
+        :gsub("_%d+$", "")
+        :gsub("%s*%d+%s*$", "")
+        :gsub("[%s_]+", " ")
+        :gsub("([^%w%s])", "")
+        :match("^%s*(.-)%s*$")
+
+    if cleaned:find("fishing") or cleaned:find("rod") or cleaned:find("canne") or cleaned:find("pêche") then
+        if cleaned:find("ultimate") or cleaned:find("ult") then
+            return "Ultimate Fishing Rod"
+        elseif cleaned:find("advanced") then
+            return "Advanced Fishing Rod"
+        elseif cleaned:find("pro") then
+            return "Pro Fishing Rod"
+        else
+            return "Regular Fishing Rod"
+        end
+    end
+
+    if nameCache[originalName] then 
+        return nameCache[originalName] 
+    end
+    
+    local h = t:FindFirstChild("Handle")
+    local fallbackName = cleaned
+    
+    for _, folder in ipairs({ReplicatedStorage:FindFirstChild("Items"), StarterPack}) do
+        if folder then
+            for _, item in ipairs(folder:GetDescendants()) do
+                if item:IsA("Tool") and item:FindFirstChild("Handle") then
+                    local match = true
+                    if h then
+                        for _, c in ipairs(h:GetChildren()) do
+                            if not item.Handle:FindFirstChild(c.Name) then 
+                                match = false 
+                                break 
+                            end
+                        end
+                    else
+                        match = false
+                    end
+                    if match then 
+                        nameCache[originalName] = item.Name 
+                        return item.Name 
+                    end
+                end
+            end
+        end
+    end
+    
+    nameCache[originalName] = fallbackName
+    return fallbackName
+end
+
+local function saveConfig(profileName)
+    pcall(function()
+        if not writefile then return end
+        local fileName = ConfigFolder .. "/" .. profileName .. ".json"
+        local serializable = {
+            CurrentProfile = profileName,
+            AimbotActive = Config.AimbotActive,
+            AimKey = typeof(Config.AimKey) == "EnumItem" and Config.AimKey.Name or tostring(Config.AimKey),
+            FOVRadius = Config.FOVRadius,
+            FOVOffsetY = Config.FOVOffsetY,
+            ShowFOV = Config.ShowFOV,
+            AimPartMode = Config.AimPartMode,
+            AimStrength = Config.AimStrength,
+            WallCheck = Config.WallCheck,
+            ESPEnabled = Config.ESPEnabled,
+            ESPInventoryEnabled = Config.ESPInventoryEnabled,
+            MenuKey = typeof(Config.MenuKey) == "EnumItem" and Config.MenuKey.Name or tostring(Config.MenuKey)
+        }
+        writefile(fileName, game:GetService("HttpService"):JSONEncode(serializable))
+        writefile(BootConfigPath, game:GetService("HttpService"):JSONEncode({DefaultProfile = profileName}))
+    end)
+end
+
+local function loadConfig(profileName)
+    local successLoad = pcall(function()
+        if not readfile or not isfile then return false end
+        local fileName = ConfigFolder .. "/" .. profileName .. ".json"
+        if isfile(fileName) then
+            local decoded = game:GetService("HttpService"):JSONDecode(readfile(fileName))
+            if decoded then
+                for k, v in pairs(decoded) do
+                    if k == "AimKey" or k == "MenuKey" then
+                        pcall(function() Config[k] = Enum.KeyCode[v] or Enum.UserInputType[v] or Enum.KeyCode.E end)
+                    else
+                        Config[k] = v
+                    end
+                end
+                Config.CurrentProfile = profileName
+                return true
+            end
+        end
+        return false
+    end)
+    return successLoad
+end
+
+pcall(function()
+    if readfile and isfile and isfile(BootConfigPath) then
+        local bootData = game:GetService("HttpService"):JSONDecode(readfile(BootConfigPath))
+        if bootData and bootData.DefaultProfile then
+            loadConfig(bootData.DefaultProfile)
+        end
+    end
+end)
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "Tx15_Stealth_Menu"
+
+pcall(function()
+    if gethui then
+        ScreenGui.Parent = gethui()
+    else
+        ScreenGui.Parent = CoreGui
+    end
+end)
+if not ScreenGui.Parent then
+    ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui", 2)
+end
+ScreenGui.ResetOnSpawn = false
+
+-- FOV Circle Container
+local FOVContainer = Instance.new("Frame")
+FOVContainer.Name = "FOVCircleContainer"
+FOVContainer.Size = UDim2.new(1, 0, 1, 0)
+FOVContainer.BackgroundTransparency = 1
+FOVContainer.Visible = Config.ShowFOV
+FOVContainer.Parent = ScreenGui
+
+local FOVFrame = Instance.new("Frame")
+FOVFrame.Name = "CircleInner"
+FOVFrame.Size = UDim2.new(0, Config.FOVRadius * 2, 0, Config.FOVRadius * 2)
+FOVFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+FOVFrame.Position = UDim2.new(0.5, 0, 0.5, Config.FOVOffsetY)
+FOVFrame.BackgroundTransparency = 1
+FOVFrame.Parent = FOVContainer
+
+local InnerStroke = Instance.new("UIStroke")
+InnerStroke.Color = Color3.fromRGB(0, 255, 200)
+InnerStroke.Thickness = 3
+InnerStroke.Parent = FOVFrame
+
+local InnerCorner = Instance.new("UICorner")
+InnerCorner.CornerRadius = UDim.new(1, 0)
+InnerCorner.Parent = FOVFrame
+
+-- Main UI Container
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "CartoonyContainer"
+MainFrame.Size = UDim2.new(0, 640, 0, 480)
+MainFrame.Position = UDim2.new(0.5, -320, 0.5, -240)
+MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 14)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(0, 255, 200)
+MainStroke.Thickness = 3
+MainStroke.Parent = MainFrame
+
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 52)
+Header.BackgroundColor3 = Color3.fromRGB(24, 24, 36)
+Header.BorderSizePixel = 0
+Header.Parent = MainFrame
+
+local HeaderCorner = Instance.new("UICorner")
+HeaderCorner.CornerRadius = UDim.new(0, 14)
+HeaderCorner.Parent = Header
+
+local HeaderCover = Instance.new("Frame")
+HeaderCover.Size = UDim2.new(1, 0, 0, 10)
+HeaderCover.Position = UDim2.new(0, 0, 1, -10)
+HeaderCover.BackgroundColor3 = Color3.fromRGB(24, 24, 36)
+HeaderCover.BorderSizePixel = 0
+HeaderCover.Parent = Header
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -60, 1, 0)
+TitleLabel.Position = UDim2.new(0, 20, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "★ TX15 DEV // PURE AIMBOT ENGINE ★"
+TitleLabel.TextColor3 = Color3.fromRGB(0, 255, 200)
+TitleLabel.TextSize = 13
+TitleLabel.Font = Enum.Font.FredokaOne
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = Header
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 32, 0, 32)
+CloseBtn.Position = UDim2.new(1, -44, 0.5, -16)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(255, 69, 58)
+CloseBtn.Text = "✕"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.TextSize = 14
+CloseBtn.Font = Enum.Font.FredokaOne
+CloseBtn.BorderSizePixel = 0
+CloseBtn.Parent = Header
+
+local CloseCorner = Instance.new("UICorner")
+CloseCorner.CornerRadius = UDim.new(1, 0)
+CloseCorner.Parent = CloseBtn
+
+CloseBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+end)
+
+local Sidebar = Instance.new("Frame")
+Sidebar.Size = UDim2.new(0, 140, 1, -68)
+Sidebar.Position = UDim2.new(0, 12, 0, 58)
+Sidebar.BackgroundColor3 = Color3.fromRGB(25, 25, 38)
+Sidebar.BorderSizePixel = 0
+Sidebar.Parent = MainFrame
+
+local SidebarCorner = Instance.new("UICorner")
+SidebarCorner.CornerRadius = UDim.new(0, 10)
+SidebarCorner.Parent = Sidebar
+
+local SidebarLayout = Instance.new("UIListLayout")
+SidebarLayout.SortOrder = Enum.SortOrder.LayoutOrder
+SidebarLayout.Padding = UDim.new(0, 8)
+SidebarLayout.Parent = Sidebar
+
+local Container = Instance.new("Frame")
+Container.Size = UDim2.new(1, -172, 1, -68)
+Container.Position = UDim2.new(0, 160, 0, 58)
+Container.BackgroundColor3 = Color3.fromRGB(22, 22, 32)
+Container.BorderSizePixel = 0
+Container.Parent = MainFrame
+
+local ContainerCorner = Instance.new("UICorner")
+ContainerCorner.CornerRadius = UDim.new(0, 10)
+ContainerCorner.Parent = Container
+
+local Pages = {}
+local function createPage(name)
+    local page = Instance.new("ScrollingFrame")
+    page.Name = name .. "_Page"
+    page.Size = UDim2.new(1, -6, 1, -6)
+    page.Position = UDim2.new(0, 3, 0, 3)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 4
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.Visible = false
+    page.Parent = Container
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 8)
+    layout.Parent = page
+
+    Pages[name] = page
+    return page
+end
+
+local aimbotPage = createPage("Aimbot")
+local espPage = createPage("ESP")
+local configPage = createPage("Configs")
+
+local function createTabButton(name, targetPage)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -12, 0, 42)
+    btn.Position = UDim2.new(0, 6, 0, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(32, 32, 48)
+    btn.Text = name
+    btn.TextColor3 = Color3.fromRGB(180, 180, 200)
+    btn.TextSize = 13
+    btn.Font = Enum.Font.FredokaOne
+    btn.BorderSizePixel = 0
+    btn.Parent = Sidebar
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = btn
+
+    btn.MouseButton1Click:Connect(function()
+        for _, p in pairs(Pages) do p.Visible = false end
+        targetPage.Visible = true
+    end)
+end
+
+createTabButton("🎯 Aimbot", aimbotPage)
+createTabButton("👁️ ESP", espPage)
+createTabButton("💾 Configs", configPage)
+aimbotPage.Visible = true
+
+local aimbotToggleBtn
+
+local function createToggle(parent, text, initial, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -6, 0, 40)
+    btn.BackgroundColor3 = initial and Color3.fromRGB(0, 180, 120) or Color3.fromRGB(35, 35, 50)
+    btn.Text = text .. ": " .. (initial and "ON" or "OFF")
+    btn.TextColor3 = initial and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 160, 180)
+    btn.TextSize = 13
+    btn.Font = Enum.Font.FredokaOne
+    btn.BorderSizePixel = 0
+    btn.Parent = parent
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = btn
+    
+    local state = initial
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        btn.BackgroundColor3 = state and Color3.fromRGB(0, 180, 120) or Color3.fromRGB(35, 35, 50)
+        btn.Text = text .. ": " .. (state and "ON" or "OFF")
+        btn.TextColor3 = state and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 160, 180)
+        callback(state)
+        saveConfig(Config.CurrentProfile)
+    end)
+
+    if text:find("Aimbot Active") then
+        aimbotToggleBtn = btn
+    end
+end
+
+local function createSelector(parent, text, options, current, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -6, 0, 40)
+    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 44)
+    frame.BorderSizePixel = 0
+    frame.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, 0, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(180, 180, 200)
+    label.TextSize = 13
+    label.Font = Enum.Font.FredokaOne
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.44, 0, 0.8, 0)
+    btn.Position = UDim2.new(0.54, 0, 0.1, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(0, 255, 200)
+    btn.Text = tostring(current)
+    btn.TextColor3 = Color3.fromRGB(18, 18, 26)
+    btn.TextSize = 13
+    btn.Font = Enum.Font.FredokaOne
+    btn.BorderSizePixel = 0
+    btn.Parent = frame
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = btn
+
+    local idx = 1
+    for i, opt in ipairs(options) do if tostring(opt) == tostring(current) then idx = i end end
+
+    btn.MouseButton1Click:Connect(function()
+        idx = idx % #options + 1
+        current = options[idx]
+        btn.Text = tostring(current)
+        callback(current)
+        saveConfig(Config.CurrentProfile)
+    end)
+end
+
+local function createKeybindBinder(parent, text, currentKey, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -6, 0, 40)
+    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 44)
+    frame.BorderSizePixel = 0
+    frame.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, 0, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(180, 180, 200)
+    label.TextSize = 13
+    label.Font = Enum.Font.FredokaOne
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.44, 0, 0.8, 0)
+    btn.Position = UDim2.new(0.54, 0, 0.1, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+    local keyName = typeof(currentKey) == "EnumItem" and currentKey.Name or tostring(currentKey)
+    btn.Text = "[" .. keyName .. "]"
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.TextSize = 13
+    btn.Font = Enum.Font.FredokaOne
+    btn.BorderSizePixel = 0
+    btn.Parent = frame
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = btn
+
+    local listening = false
+    btn.MouseButton1Click:Connect(function()
+        if listening then return end
+        listening = true
+        btn.Text = "[PRESS KEY]"
+        
+        local conn
+        conn = UserInputService.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Keyboard then
+                local newKey = input.KeyCode
+                btn.Text = "[" .. newKey.Name .. "]"
+                listening = false
+                conn:Disconnect()
+                callback(newKey)
+                saveConfig(Config.CurrentProfile)
+            end
+        end)
+    end)
+end
+
+-- Populate Aimbot Tab
+createToggle(aimbotPage, "🎯 Aimbot Active", Config.AimbotActive, function(v) Config.AimbotActive = v end)
+createToggle(aimbotPage, "⭕ Show FOV Circle", Config.ShowFOV, function(v) 
+    Config.ShowFOV = v 
+    FOVContainer.Visible = v
+end)
+createSelector(aimbotPage, "📏 FOV Size", {60, 90, 140, 200, 300, 600}, Config.FOVRadius, function(v) 
+    Config.FOVRadius = tonumber(v) 
+    FOVFrame.Size = UDim2.new(0, Config.FOVRadius * 2, 0, Config.FOVRadius * 2)
+end)
+createSelector(aimbotPage, "📍 FOV Vertical Offset", {-80, -60, -45, -30, -15, 0, 15, 30, 45, 60, 80}, Config.FOVOffsetY, function(v) 
+    Config.FOVOffsetY = tonumber(v) 
+end)
+createToggle(aimbotPage, "🧱 Wallcheck Enabled", Config.WallCheck, function(v) Config.WallCheck = v end)
+
+local modeNames = {}
+for _, m in ipairs(AIM_MODES) do table.insert(modeNames, m.name) end
+createSelector(aimbotPage, "🦴 Aim Target Mode", modeNames, AIM_MODES[Config.AimPartMode].name, function(v) 
+    for idx, m in ipairs(AIM_MODES) do
+        if m.name == v then Config.AimPartMode = idx break end
+    end
+end)
+
+createSelector(aimbotPage, "⚡ Smoothness / Strength", {"Rage (Instant Snap)", 0.05, 0.1, 0.2, 0.5}, "Rage (Instant Snap)", function(v) 
+    if v == "Rage (Instant Snap)" then
+        Config.AimStrength = 1.0
+    else
+        Config.AimStrength = tonumber(v)
+    end
+end)
+
+createKeybindBinder(aimbotPage, "⌨️ Aimbot Toggle Key", Config.AimKey, function(k) Config.AimKey = k end)
+createKeybindBinder(aimbotPage, "📂 Menu Open/Close Key", Config.MenuKey, function(k) Config.MenuKey = k end)
+
+-- Populate ESP Tab
+createToggle(espPage, "👁️ ESP Overlays", Config.ESPEnabled, function(v) Config.ESPEnabled = v end)
+createToggle(espPage, "🎒 ESP Inventory Items", Config.ESPInventoryEnabled, function(v) 
+    Config.ESPInventoryEnabled = v 
+    for _, p in ipairs(Players:GetPlayers()) do
+        local bb = BillboardCache[p]
+        if bb then bb.Enabled = v end
+    end
+end)
+
+local profileNameBox = Instance.new("TextBox")
+profileNameBox.Size = UDim2.new(1, -6, 0, 40)
+profileNameBox.BackgroundColor3 = Color3.fromRGB(30, 30, 44)
+profileNameBox.Text = Config.CurrentProfile
+profileNameBox.TextColor3 = Color3.fromRGB(220, 220, 240)
+profileNameBox.TextSize = 13
+profileNameBox.Font = Enum.Font.FredokaOne
+profileNameBox.ClearTextOnFocus = false
+profileNameBox.BorderSizePixel = 0
+profileNameBox.Parent = configPage
+
+local boxCorner = Instance.new("UICorner")
+boxCorner.CornerRadius = UDim.new(0, 8)
+boxCorner.Parent = profileNameBox
+
+local saveProfileBtn = Instance.new("TextButton")
+saveProfileBtn.Size = UDim2.new(1, -6, 0, 42)
+saveProfileBtn.BackgroundColor3 = Color3.fromRGB(0, 180, 120)
+saveProfileBtn.Text = "💾 Save / Create Profile"
+saveProfileBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+saveProfileBtn.TextSize = 13
+saveProfileBtn.Font = Enum.Font.FredokaOne
+saveProfileBtn.BorderSizePixel = 0
+saveProfileBtn.Parent = configPage
+
+local saveCorner = Instance.new("UICorner")
+saveCorner.CornerRadius = UDim.new(0, 8)
+saveCorner.Parent = saveProfileBtn
+
+saveProfileBtn.MouseButton1Click:Connect(function()
+    local name = profileNameBox.Text
+    if name and name ~= "" then
+        Config.CurrentProfile = name
+        saveConfig(name)
+        saveProfileBtn.Text = "✅ Profile Saved & Auto-Load Set!"
+        task.wait(1.5)
+        saveProfileBtn.Text = "💾 Save / Create Profile"
+    end
+end)
+
+local loadProfileBtn = Instance.new("TextButton")
+loadProfileBtn.Size = UDim2.new(1, -6, 0, 42)
+loadProfileBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+loadProfileBtn.Text = "📂 Load Profile & Auto-Load"
+loadProfileBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+loadProfileBtn.TextSize = 13
+loadProfileBtn.Font = Enum.Font.FredokaOne
+loadProfileBtn.BorderSizePixel = 0
+loadProfileBtn.Parent = configPage
+
+local loadCorner = Instance.new("UICorner")
+loadCorner.CornerRadius = UDim.new(0, 8)
+loadCorner.Parent = loadProfileBtn
+
+loadProfileBtn.MouseButton1Click:Connect(function()
+    local name = profileNameBox.Text
+    if name and name ~= "" then
+        if loadConfig(name) then
+            FOVFrame.Size = UDim2.new(0, Config.FOVRadius * 2, 0, Config.FOVRadius * 2)
+            FOVContainer.Visible = Config.ShowFOV
+            pcall(function()
+                if writefile then
+                    writefile(BootConfigPath, game:GetService("HttpService"):JSONEncode({DefaultProfile = name}))
+                end
+            end)
+            loadProfileBtn.Text = "✅ Loaded & Auto-Load Updated!"
+        else
+            loadProfileBtn.Text = "❌ Profile Not Found!"
+        end
+        task.wait(1.5)
+        loadProfileBtn.Text = "📂 Load Profile & Auto-Load"
+    end
+end)
+
+-- Integrated Name + Health Bar + Inventory ESP Logic
+local function updateESP(p)
+    local bb = BillboardCache[p]
+    if not bb then return end
+    
+    local char = p.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") or not Config.ESPEnabled then 
+        bb.Enabled = false
+        return 
+    end
+    
+    local lChar = LocalPlayer.Character
+    if lChar and lChar:FindFirstChild("HumanoidRootPart") then
+        local dist = (lChar.HumanoidRootPart.Position - char.HumanoidRootPart.Position).Magnitude
+        if dist > MAX_DISTANCE then
+            bb.Enabled = false
+            return
+        end
+    end
+
+    local container = bb:FindFirstChild("EspContainer")
+    if not container then return end
+    container:ClearAllChildren()
+
+    local layout = Instance.new("UIListLayout", container)
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.VerticalAlignment = Enum.VerticalAlignment.Bottom 
+    layout.Padding = UDim.new(0, 2)
+
+    -- Player Name & Health Bar Display
+    local nameLbl = Instance.new("TextLabel", container)
+    nameLbl.Size = UDim2.new(0, 200, 0, 16)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Text = p.DisplayName ~= p.Name and (p.DisplayName .. " (@" .. p.Name .. ")") or p.Name
+    nameLbl.Font = Enum.Font.FredokaOne
+    nameLbl.TextSize = 11
+    nameLbl.TextColor3 = Color3.fromRGB(0, 255, 200)
+    nameLbl.TextStrokeTransparency = 0.2
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local hpBg = Instance.new("Frame", container)
+        hpBg.Size = UDim2.new(0, 120, 0, 5)
+        hpBg.BackgroundColor3 = Color3.new(0, 0, 0)
+        Instance.new("UICorner", hpBg).CornerRadius = UDim.new(0, 3)
+
+        local ratio = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+        local hpFill = Instance.new("Frame", hpBg)
+        hpFill.Size = UDim2.new(ratio, 0, 1, 0)
+        hpFill.BackgroundColor3 = Color3.fromRGB(0, 255, 120)
+        Instance.new("UICorner", hpFill).CornerRadius = UDim.new(0, 3)
+    end
+
+    -- Inventory Tools Display
+    if Config.ESPInventoryEnabled then
+        local tools = {}
+        if p:FindFirstChild("Backpack") then
+            for _, t in ipairs(p.Backpack:GetChildren()) do
+                if t:IsA("Tool") and t.Name:lower() ~= "fists" then table.insert(tools, t) end
+            end
+        end
+        if char then
+            for _, t in ipairs(char:GetChildren()) do
+                if t:IsA("Tool") and t.Name:lower() ~= "fists" then table.insert(tools, t) end
+            end
+        end
+
+        for _, tool in ipairs(tools) do
+            local name = getRealName(tool)
+            if name then
+                local lbl = Instance.new("TextLabel", container)
+                lbl.Size = UDim2.new(0, 180, 0, 14)
+                lbl.BackgroundTransparency = 1
+                lbl.Text = "🎒 " .. name
+                lbl.Font = Enum.Font.SourceSansBold
+                lbl.TextSize = 10
+                lbl.TextStrokeTransparency = 0.4
+                
+                local rarity = tool:GetAttribute("RarityName") or tool:GetAttribute("Rarity")
+                lbl.TextColor3 = RARITY_COLORS[rarity] or Color3.new(1, 1, 1)
+            end
+        end
+    end
+
+    bb.Enabled = Config.ESPEnabled
+end
+
+local function createESP(p)
+    if p == LocalPlayer then return end
+    
+    local function setup(char)
+        local root = char:WaitForChild("HumanoidRootPart", 15)
+        if not root then return end
+        
+        if BillboardCache[p] then BillboardCache[p]:Destroy() end
+        
+        local bb = Instance.new("BillboardGui", root)
+        bb.Name = "FixedUnderfootESP"
+        bb.Size = UDim2.new(0, 200, 0, 160)
+        bb.StudsOffset = Vector3.new(0, -3.5, 0) 
+        bb.AlwaysOnTop = true
+        bb.MaxDistance = MAX_DISTANCE
+        
+        local cont = Instance.new("Frame", bb)
+        cont.Name = "EspContainer"
+        cont.Size = UDim2.new(1, 0, 1, 0)
+        cont.BackgroundTransparency = 1
+        
+        BillboardCache[p] = bb
+
+        updateESP(p)
+        
+        char.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") then task.wait(0.1); updateESP(p) end
+        end)
+        char.ChildRemoved:Connect(function(child)
+            if child:IsA("Tool") then task.wait(0.1); updateESP(p) end
+        end)
+        
+        local backpack = p:WaitForChild("Backpack", 5)
+        if backpack then
+            backpack.ChildAdded:Connect(function() updateESP(p) end)
+            backpack.ChildRemoved:Connect(function() updateESP(p) end)
+        end
+
+        task.spawn(function()
+            while char.Parent and bb.Parent do
+                updateESP(p)
+                task.wait(UPDATE_INTERVAL)
+            end
+        end)
+    end
+    
+    p.CharacterAdded:Connect(setup)
+    if p.Character then setup(p.Character) end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do createESP(p) end
+Players.PlayerAdded:Connect(createESP)
+
+-- Streamlined On-Foot Target Acquisition
+local function GetTargetPart(char)
+    local mode = AIM_MODES[Config.AimPartMode]
+    local partName = mode.parts and mode.parts[currentAutoIndex] or mode.part
+    
+    local part = char:FindFirstChild(partName)
+    if not part then
+        if partName == "RightUpperArm" then part = char:FindFirstChild("Right Arm") end
+        if partName == "LeftUpperArm"   then part = char:FindFirstChild("Left Arm") end
+    end
+    return part or char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+end
+
+local function IsVisible(part)
+    if not part then return false end
+    local origin = Camera.CFrame.Position
+    local direction = (part.Position - origin)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.FilterDescendantsInstances = {LocalPlayer.Character or workspace, part.Parent}
+    local result = workspace:Raycast(origin, direction, params)
+    return not result
+end
+
+local function GetClosestTarget()
+    local closest, distMin = nil, Config.FOVRadius
+    local center = Vector2.new(Camera.ViewportSize.X / 2, (Camera.ViewportSize.Y / 2) + Config.FOVOffsetY)
+    
+    for _, p in Players:GetPlayers() do
+        if p ~= LocalPlayer and p.Character then
+            local char = p.Character
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            
+            if humanoid and humanoid.Health > 0 then
+                local candidatePart = GetTargetPart(char)
+                
+                if candidatePart then
+                    local calcPos = candidatePart.Position
+                    
+                    -- Simple On-Foot Velocity Lead Prediction
+                    local root = char:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        calcPos = calcPos + (root.AssemblyLinearVelocity * PREDICTION_TIME)
+                    end
+                    
+                    local screenPos, onScreen = Camera:WorldToViewportPoint(calcPos)
+                    if onScreen then
+                        local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+                        if dist < distMin then
+                            if not Config.WallCheck or IsVisible(candidatePart) then
+                                distMin = dist
+                                closest = calcPos
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+-- RenderStepped Main Tracking Loop
+RunService.RenderStepped:Connect(function()
+    pcall(function()
+        FOVFrame.Position = UDim2.new(0.5, 0, 0.5, Config.FOVOffsetY)
+
+        if Config.AimbotActive then
+            local targetPos = GetClosestTarget()
+            if targetPos then
+                local targetCFrame = CFrame.new(Camera.CFrame.Position, targetPos)
+                
+                if Config.AimStrength >= 1.0 then
+                    Camera.CFrame = targetCFrame
+                else
+                    Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, Config.AimStrength)
+                end
+            end
+        end
+    end)
+end)
+
+-- Auto Switch Heartbeat Timer
+RunService.Heartbeat:Connect(function(dt)
+    local mode = AIM_MODES[Config.AimPartMode]
+    if not mode.parts then return end
+    lastSwitchTime = lastSwitchTime + dt
+    if lastSwitchTime >= SWITCH_INTERVAL then
+        lastSwitchTime = 0
+        currentAutoIndex = currentAutoIndex % #mode.parts + 1
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    pcall(function()
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            local aimKeyEnum = typeof(Config.AimKey) == "EnumItem" and Config.AimKey or Enum.KeyCode[tostring(Config.AimKey)] or Enum.KeyCode.E
+            local menuKeyEnum = typeof(Config.MenuKey) == "EnumItem" and Config.MenuKey or Enum.KeyCode[tostring(Config.MenuKey)] or Enum.KeyCode.Insert
+
+            if input.KeyCode == aimKeyEnum then
+                Config.AimbotActive = not Config.AimbotActive
+                if aimbotToggleBtn then
+                    aimbotToggleBtn.BackgroundColor3 = Config.AimbotActive and Color3.fromRGB(0, 180, 120) or Color3.fromRGB(35, 35, 50)
+                    aimbotToggleBtn.Text = "🎯 Aimbot Active: " .. (Config.AimbotActive and "ON" or "OFF")
+                    aimbotToggleBtn.TextColor3 = Config.AimbotActive and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 160, 180)
+                end
+            elseif input.KeyCode == menuKeyEnum then
+                MainFrame.Visible = not MainFrame.Visible
+            end
+        end
+    end)
+end)
